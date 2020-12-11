@@ -6,18 +6,18 @@ import torch.nn.functional as F
 class RBM():
 
     def __init__(self, num_v, num_h, k=1, learning_rate=1e-3, momentum_coefficient=0.5,
-                 weight_decay=1e-4, cuda=False):
+                 weight_decay=1e-4, v_bias=None, cuda=True):
         self.num_v = num_v
         self.num_h = num_h
         self.k = k
-        self.learning_rate = learning_rate
+        self.lr = learning_rate
         self.momentum_coefficient = momentum_coefficient
         self.weight_decay = weight_decay
         self.device = torch.device('cpu')
         self.cuda = cuda
 
         self.weights = torch.randn(num_v, num_h) * 0.01
-        self.v_bias = torch.ones(num_v) * 0.5
+        self.v_bias = torch.ones(num_v) * 0.5 if v_bias is None else v_bias
         self.h_bias = torch.zeros(num_h)
 
         self.weights_momentum = torch.zeros(num_v, num_h)
@@ -51,43 +51,46 @@ class RBM():
         visible_probabilities = torch.sigmoid(visible_activations)
         return visible_probabilities
 
+    def binarize(self, samples):
+        # The hidden unit turns on if the sampled probability is greater
+        # than a random number uniformly distributed between 0 and 1
+        p = torch.rand(self.num_h).to(self.device)
+        activated_units = (samples >= p).float()
+        return activated_units
+
     def forward(self, input_data, train=True):
         # Positive phase
         pos_hidden_probabilities = self.sample_hidden(input_data)
-        pos_hidden_activations = (pos_hidden_probabilities >= torch.rand(self.num_h).to(self.device)).float()
-        positive_associations = torch.matmul(input_data.t(), pos_hidden_activations)
+        hidden_activations = self.binarize(pos_hidden_probabilities)
+        positive_associations = torch.matmul(input_data.t(), hidden_activations)
 
         # Negative phase
-        hidden_activations = pos_hidden_activations
-
         for step in range(self.k):
-            visible_probabilities = self.sample_visible(hidden_activations)
-            hidden_probabilities = self.sample_hidden(visible_probabilities)
-            hidden_activations = (hidden_probabilities >= torch.rand(self.num_h).to(self.device)).float()
-
-        neg_visible_probabilities = visible_probabilities
-        neg_hidden_probabilities = hidden_probabilities
-        negative_associations = torch.matmul(neg_visible_probabilities.t(), neg_hidden_probabilities)
+            # Gibbs sampling
+            neg_visible_probabilities = self.sample_visible(hidden_activations)
+            neg_hidden_probabilities = self.sample_hidden(neg_visible_probabilities)
+            hidden_activations = self.binarize(neg_hidden_probabilities)
+        negative_associations = torch.matmul(neg_visible_probabilities.t(), hidden_activations)
 
         if train:
-            # Update parameters
+            # Update momentum
             self.weights_momentum *= self.momentum_coefficient
-            self.weights_momentum += (positive_associations - negative_associations)
+            self.weights_momentum += (positive_associations - negative_associations) * self.lr
 
             self.v_bias_momentum *= self.momentum_coefficient
-            self.v_bias_momentum += torch.sum(input_data - neg_visible_probabilities, dim=0)
+            self.v_bias_momentum += torch.sum(input_data - neg_visible_probabilities, dim=0) * self.lr
 
             self.h_bias_momentum *= self.momentum_coefficient
-            self.h_bias_momentum += torch.sum(pos_hidden_probabilities - neg_hidden_probabilities, dim=0)
+            self.h_bias_momentum += torch.sum(pos_hidden_probabilities - neg_hidden_probabilities, dim=0) * self.lr
 
+            # Update weights and biases
             batch_size = input_data.size(0)
+            self.weights += self.weights_momentum / batch_size
+            self.v_bias += self.v_bias_momentum / batch_size
+            self.h_bias += self.h_bias_momentum / batch_size
 
-            self.weights += self.weights_momentum * self.learning_rate / batch_size
-            self.v_bias += self.v_bias_momentum * self.learning_rate / batch_size
-            self.h_bias += self.h_bias_momentum * self.learning_rate / batch_size
-
-            self.weights -= self.weights * self.weight_decay  # L2 weight decay
-
+            # L2 weight decay
+            self.weights -= self.weights * self.weight_decay
         return input_data, neg_visible_probabilities
 
     def free_energy(self, v):
@@ -113,5 +116,4 @@ class RBM():
 
         # Compute reconstruction error
         error = F.mse_loss(input_data, neg_visible_probabilities)
-
         return error
